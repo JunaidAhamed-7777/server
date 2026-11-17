@@ -16,16 +16,17 @@
 #pragma once
 #include "backup_stages.h"
 #include <stdint.h>
+#include "my_sys.h"
 
 /** BACKUP SERVER target */
 struct backup_target
 {
 #ifdef _WIN32
-  /** Target directory path name, or nullptr if streaming */
+  /** Target directory name, or nullptr if streaming (@see backup_sink) */
   const char *path;
   bool operator==(const backup_target &o) const { return path == o.path; }
 #else
-  /** Target directory descriptor, or -1 if streaming */
+  /** Target directory descriptor, or -1 if streaming (@see backup_sink) */
   int fd;
   bool operator==(const backup_target &o) const { return fd == o.fd; }
 #endif
@@ -36,17 +37,10 @@ struct backup_sink
 {
   /** worker identifier: 0 to CONCURRENT-1 (the connection thread) */
   int id;
-#ifdef _WIN32
   /** A value indicating an invalid stream */
-  static constexpr HANDLE NO_STREAM{INVALID_HANDLE_VALUE};
-  /** Target pipe, or NO_STREAM if path!=nullptr */
-  HANDLE stream;
-#else
-  /** A value indicating an invalid file descriptor or stream */
-  static constexpr int NO_STREAM{-1};
-  /** Target pipe, or NO_STREAM if copying to a directory */
-  int stream;
-#endif
+  static constexpr my_native_file NO_STREAM{IF_WIN(INVALID_HANDLE_VALUE,-1)};
+  /** Target pipe, or NO_STREAM when not streaming */
+  my_native_file stream;
   /** storage engine context returned by handlerton::backup_start() */
   void *ha_data;
 };
@@ -60,41 +54,13 @@ struct backup_chunk
   uint64_t length;
 };
 
-/** File descriptor */
-typedef IF_WIN(HANDLE, int) backup_fd;
-
-#ifdef _WIN32
-/* Use CopyFileEx() to copy entire files */
-#elif defined __APPLE__
-/* You should invoke fclonefileat(2) manually before attempting
-copy_entire_file() or backup::copy() */
-# include <sys/attr.h>
-# include <sys/clonefile.h>
-# include <copyfile.h>
-/** Copy an entire file.
-@param src  source file descriptor
-@param dst  target to append src to
-@return error code (negative)
-@retval 0   on success */
-inline int copy_entire_file(int src, int dst) noexcept
-{
-  return fcopyfile(src, dst, NULL, COPYFILE_ALL | COPYFILE_CLONE);
-}
-#else
-/** Copy an entire file.
-@param src  source file descriptor
-@param dst  target to append src to
-@return error code (non-positive)
-@retval 0   on success */
-int copy_entire_file(int src, int dst) noexcept;
-#endif
-
 #ifdef _WIN32
 struct native_file_handle;
 #endif
 namespace backup {
 
-typedef IF_WIN(native_file_handle, int) handle;
+#ifdef _WIN32
+typedef native_file_handle handle;
 
 /**
    Copy a portion of a file.
@@ -105,9 +71,13 @@ typedef IF_WIN(native_file_handle, int) handle;
    @return error code (non-positive)
    @retval 0   on success
 */
-int copy(handle src, backup_fd dst, uint64_t start, uint64_t end) noexcept;
+int copy(native_file_handle src, HANDLE dst, uint64_t start, uint64_t end)
+  noexcept;
 
-#ifndef _WIN32
+#else
+inline int copy(int src, int dst, uint64_t start, uint64_t end) noexcept
+{ return my_copy_file_range(src, dst, start, end); }
+
 /**
    Copy or stream a file.
    @param target     BACKUP SERVER target (possibly, a directory)
@@ -146,30 +116,14 @@ int copy_or_stream(const backup_target &target, const backup_sink &sink,
    @return error code (non-positive)
    @retval 0   on success
 */
-int append(handle src, backup_fd stream, uint64_t start, uint64_t end)
-  noexcept;
+int append(my_native_file src, my_native_file stream,
+           uint64_t start, uint64_t end) noexcept;
 
 #ifdef _WIN32
-int append(backup_fd src, backup_fd stream, uint64_t start, uint64_t end)
-  noexcept;
-int copy(backup_fd src, backup_fd dst, uint64_t start, uint64_t end) noexcept;
+int append(native_file_handle src, my_native_file stream,
+           uint64_t start, uint64_t end) noexcept;
 #endif
 }
-
-#ifdef __linux__
-/**
-   Try to clone a portion of a file.
-   @param dst   destination file descriptor
-   @param src   source file descriptor
-   @param start first offset to clone
-   @param l     length to clone
-   @return error code (non-positive)
-   @retval 0   on success
-   @retval 1   if a fallback to backup::copy() is needed
-*/
-int clone_file_range(int dst, int src, uint64_t start, uint64_t l) noexcept;
-# define clone_file_range clone_file_range
-#endif
 
 /** Append to the configuration file.
 @param target   backup target directory
@@ -186,8 +140,8 @@ int backup_config_append(IF_WIN(const char*, int) target,
 @param size     length of the snippet
 @return error code (non-positive)
 @retval 0   on success */
-int backup_stream_config(backup_fd stream, const char *config, size_t size)
-  noexcept;
+int backup_stream_config(my_native_file stream, const char *config,
+                         size_t size) noexcept;
 
 /** Start streaming a file.
 @param target   backup target
@@ -198,7 +152,7 @@ int backup_stream_config(backup_fd stream, const char *config, size_t size)
 @param n_chunks number of chunks; 0 unless sparse file
 @return error code (non-positive)
 @retval 0   on success */
-int backup_stream_start(backup_fd stream,
+int backup_stream_start(my_native_file stream,
                         const char *name, mode_t mode, uint64_t size,
                         const backup_chunk *chunks, size_t n_chunks) noexcept;
 
@@ -210,7 +164,7 @@ int backup_stream_start(backup_fd stream,
    @return error code (non-positive)
    @retval 0 on success
 */
-int backup_stream_write(backup_fd stream, const void *buf, size_t size)
+int backup_stream_write(my_native_file stream, const void *buf, size_t size)
   noexcept;
 
 /**
@@ -221,7 +175,7 @@ int backup_stream_write(backup_fd stream, const void *buf, size_t size)
    @return error code (non-positive)
    @retval 0   on success
 */
-int backup_stream_zeropad(backup_fd stream, size_t written) noexcept;
+int backup_stream_zeropad(my_native_file stream, size_t written) noexcept;
 
 #ifdef _WIN32
 # define backup_stream_append_async backup::append

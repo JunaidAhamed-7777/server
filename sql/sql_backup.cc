@@ -73,10 +73,8 @@ using tpool::pwrite;
 #else
 # include <sys/types.h>
 # include <dirent.h>
-# include <sys/mman.h>
 # ifdef __linux__
-#  include <sys/ioctl.h>
-#  include <linux/fs.h> /* FICLONE, FICLONERANGE (Linux 4.5) */
+#  include <sys/sendfile.h>
 # endif
 #endif
 
@@ -91,24 +89,18 @@ using tpool::pwrite;
    @retval 0  on success
 */
 template<bool stream>
-static ssize_t pread_write(backup::handle in_fd, backup_fd out_fd,
-                           uint64_t o, uint64_t end) noexcept
+static int pread_write(IF_WIN(native_file_handle, int) in_fd,
+                       my_native_file out_fd,
+                       uint64_t o, uint64_t end) noexcept
 {
+  assert(out_fd != backup_sink::NO_STREAM);
   assert(end >= o);
   uint64_t count{end - o};
   if (!count)
     return 0;
-#if SIZEOF_SIZE_T < 8
-  size_t size{65536};
-#else
-  /*
-    Copy up to this much at a time. The copying of InnoDB data files
-    is additionally limited by fil_space_t::BACKUP_BATCH_SIZE.
-  */
   constexpr size_t max_size{4 << 20};
   /* An integer multiple of 4096 bytes, up to max_size */
   size_t size{count >= max_size ? max_size : (size_t(count) + 4095) & ~4095};
-#endif
   char *b= static_cast<char*>(aligned_malloc(size, 4096));
   if (!b)
   {
@@ -120,9 +112,6 @@ static ssize_t pread_write(backup::handle in_fd, backup_fd out_fd,
     return -1;
   }
   ssize_t ret;
-#ifdef __linux__
-  bool first{true};
-#endif
   for (;;)
   {
     if (count < size)
@@ -130,9 +119,6 @@ static ssize_t pread_write(backup::handle in_fd, backup_fd out_fd,
     ret= pread(in_fd, b, ssize_t(size), o);
     if (ret > 0)
     {
-#ifdef POSIX_FADV_DONTNEED
-      std::ignore= posix_fadvise(in_fd, o, ret, POSIX_FADV_DONTNEED);
-#endif
       uint64_t wo{o};
       o+= ret;
       count-= uint64_t(ret);
@@ -150,19 +136,6 @@ static ssize_t pread_write(backup::handle in_fd, backup_fd out_fd,
             ret= int(wrote);
             break;
           }
-#ifdef __linux__
-          sync_file_range(out_fd, wo, wrote, SYNC_FILE_RANGE_WRITE);
-          if (first)
-            first= false;
-          else
-          {
-            sync_file_range(out_fd, 0, wo,
-                            SYNC_FILE_RANGE_WAIT_BEFORE |
-                            SYNC_FILE_RANGE_WRITE |
-                            SYNC_FILE_RANGE_WAIT_AFTER);
-            posix_fadvise(out_fd, 0, wo, POSIX_FADV_DONTNEED);
-          }
-#endif
           buf+= wrote;
           wo+= wrote;
           size-= size_t(wrote);
@@ -194,166 +167,18 @@ static ssize_t pread_write(backup::handle in_fd, backup_fd out_fd,
     }
   }
   aligned_free(b);
-#ifdef __linux__
-  /*
-    On a pipe, sync_file_range() fails with ESPIPE. Keep the errno of
-    the failed read or write for the caller.
-  */
-  const int saved_errno{errno};
-  sync_file_range(out_fd, 0, o,
-                  SYNC_FILE_RANGE_WAIT_BEFORE |
-                  SYNC_FILE_RANGE_WRITE |
-                  SYNC_FILE_RANGE_WAIT_AFTER);
-  posix_fadvise(out_fd, 0, o, POSIX_FADV_DONTNEED);
-  errno= saved_errno;
-#endif
-  return ret;
+  return int(ret);
 }
-
-#if defined __linux__ || defined __FreeBSD__
-using copying_step= ssize_t(int,int,size_t,off_t*);
-template<copying_step step,bool nonblocking>
-static ssize_t stepwise(int in_fd, int out_fd, off_t offset, off_t end)
-  noexcept
-{
-  for (;;)
-  {
-    const size_t c{size_t(std::min<off_t>(end - offset, INT_MAX >> 20 << 20))};
-    ssize_t ret= step(in_fd, out_fd, c, &offset);
-    if (ret < 0)
-    {
-      if (nonblocking && errno == EAGAIN)
-        continue;
-      return ret;
-    }
-    if (offset == end)
-      return 0;
-    if (!ret)
-      return -1;
-  }
-}
-
-/* Copy between files in a single (type of) file system */
-static inline ssize_t
-copy_step(int in_fd, int out_fd, size_t count, off_t *offset) noexcept
-{
-  return copy_file_range(in_fd, offset, out_fd, offset, count, 0);
-}
-# define cfr(src,dst,start,end) stepwise<copy_step,false>(src, dst, start, end)
-#endif
-
-#ifdef __APPLE__
-/* The inline copy_entire_file() invokes fcopyfile() */
-#elif defined _WIN32
-/* CopyFileEx() should be used */
-#else
-/** Copy a file (whole content).
-@param src  source file descriptor
-@param dst  target to append src to
-@return error code (non-positive)
-@retval 0   on success */
-int copy_entire_file(int src, int dst) noexcept
-{
-# if defined __linux__ && defined FICLONE
-  do
-  {
-    const int ret{ioctl(dst, FICLONE, src)};
-    assert(ret <= 0);
-    if (ret)
-      switch (errno) { case EOPNOTSUPP: case EXDEV: case EINVAL: continue; }
-    return ret;
-  }
-  while (false);
-# endif
-  uint64_t end(lseek(src, 0, SEEK_END));
-#ifdef POSIX_FADV_NOREUSE
-  std::ignore= posix_fadvise(src, 0, 0, POSIX_FADV_NOREUSE);
-  std::ignore= posix_fadvise(dst, 0, 0, POSIX_FADV_NOREUSE);
-#endif
-# ifdef __linux__
-  if (end >> 20 < 4)
-    /*
-      For small files, try copy_file_range(2). For large files,
-      backup::copy() should perform better with the Linux block cache.
-    */
-    do
-    {
-      const ssize_t ret{cfr(src, dst, 0, off_t(end))};
-      assert(ret <= 0);
-      if (ret) switch (errno) { case EOPNOTSUPP: case EXDEV: continue; }
-      return int(ret);
-    }
-    while (false);
-# endif
-#ifdef POSIX_FADV_SEQUENTIAL
-  std::ignore= posix_fadvise(src, 0, 0, POSIX_FADV_SEQUENTIAL);
-#endif
-  const int ret{backup::copy(src, dst, 0, end)};
-#ifdef POSIX_FADV_NORMAL
-  std::ignore= posix_fadvise(src, 0, 0, POSIX_FADV_NORMAL);
-#endif
-  return ret;
-}
-#endif
-
-#ifdef __linux__
-/**
-   Try to copy a portion of a file via ioctl(FICLONERANGE).
-   @param dst   destination file descriptor
-   @param src   source file descriptor
-   @param start first offset to clone
-   @param l     length to clone
-   @return error code (non-positive)
-   @retval 0   on success
-   @retval 1   if a fallback to backup::copy() is needed
-*/
-int clone_file_range(int dst, int src, uint64_t start, uint64_t l) noexcept
-{
-# ifdef FICLONERANGE
-  do
-  {
-    struct file_clone_range fcr{src, start, l, start};
-    const int ret{ioctl(dst, FICLONERANGE, &fcr)};
-    assert(ret <= 0);
-    if (ret)
-      switch (errno) { case EOPNOTSUPP: case EXDEV: case EINVAL: continue; }
-    return ret;
-  }
-  while (false);
-# endif
-  return 1;
-}
-#endif
 
 namespace backup {
-/** Copy a portion of a file.
-@param src   source file descriptor
-@param dst   target to append src to
-@param start first offset to copy
-@param end   last offset to copy (exclusive)
-@return error code (non-positive)
-@retval 0   on success */
-int copy(handle src, backup_fd dst, uint64_t start, uint64_t end) noexcept
-{
-  assert(end >= start);
-#ifdef __FreeBSD__
-  /* On FreeBSD, copy_file_range() without flags just works */
-  return int(cfr(src, dst, off_t(start), off_t(end)));
-#else
-  ssize_t ret{pread_write<false>(src, dst, start, end)};
-  assert(ret <= 0);
-  return int(ret);
-#endif
-}
 
 #ifdef _WIN32
-int copy(backup_fd src, backup_fd dst, uint64_t start, uint64_t end) noexcept
+int copy(native_file_handle in_fd,
+         my_native_file out_fd, uint64_t o, uint64_t end) noexcept
 {
-  return copy(native_file_handle{src}, dst, start, end);
+  return pread_write<false>(in_fd, out_fd, o, end);
 }
-#endif
-
-#ifndef _WIN32
+#else
 /**
    Copy or stream a file.
    @param target     BACKUP SERVER target (possibly, a directory)
@@ -379,7 +204,7 @@ int copy_or_stream(const backup_target &target, const backup_sink &sink,
       my_error(ER_CANT_CREATE_FILE, MYF(0), path, errno);
     else
     {
-      ret= copy_entire_file(src, dst) | close(dst);
+      ret= my_copy_file(src, dst) || close(dst);
       if (ret)
       write_error:
         my_error(ER_ERROR_ON_WRITE, MYF(0), path, errno);
@@ -482,6 +307,20 @@ int copy_or_stream(const backup_target &target, const backup_sink &sink,
 #endif
 }
 
+#ifdef _WIN32
+int append(my_native_file src, my_native_file stream,
+           uint64_t start, uint64_t end)
+  noexcept
+{
+  return append(native_file_handle{src}, stream, start, end);
+}
+
+int append(native_file_handle src, my_native_file stream,
+           uint64_t start, uint64_t end) noexcept
+{
+  return pread_write<true>(src, stream, start, end);
+}
+#else
 /**
    Append a file snippet to stream,
    after a corresponding call to backup_stream_start().
@@ -495,11 +334,11 @@ int copy_or_stream(const backup_target &target, const backup_sink &sink,
    @return error code (non-positive)
    @retval 0   on success
 */
-int append(handle src, backup_fd stream, uint64_t start, uint64_t end) noexcept
+int append(int src, int stream, uint64_t start, uint64_t end) noexcept
 {
   assert(stream != backup_sink::NO_STREAM);
   assert(end >= start);
-#if 0 /* On Linux, this turned out to be slower in our tests! */
+# if 0 /* On Linux, this turned out to be slower in our tests! */
   /*
     It is unsafe to zero-copy send from src unless we can guarantee
     that the receiving end of the pipe has consumed everything before
@@ -515,14 +354,14 @@ int append(handle src, backup_fd stream, uint64_t start, uint64_t end) noexcept
     the reader on the other end of out_fd has consumed the
     transferred data.
   */
-# ifdef __linux__
+#  ifdef __linux__
   const int pipe_size{fcntl(stream, F_GETPIPE_SZ)};
-# elif defined __FreeBSD__ || defined __APPLE__
+#  elif defined __FreeBSD__ || defined __APPLE__
   // https://unix.stackexchange.com/questions/11946/how-big-is-the-pipe-buffer
   constexpr int pipe_size{65536};
-# else
+#  else
   constexpr int pipe_size{0};
-# endif
+#  endif
   if (pipe_size > 0)
   {
     /*
@@ -540,15 +379,8 @@ int append(handle src, backup_fd stream, uint64_t start, uint64_t end) noexcept
       start= fast_end;
     }
   }
-#endif
-  return int(pread_write<true>(src, stream, start, end));
-}
-
-#ifdef _WIN32
-int append(backup_fd src, backup_fd stream, uint64_t start, uint64_t end)
-  noexcept
-{
-  return append(native_file_handle{src}, stream, start, end);
+# endif
+  return pread_write<true>(src, stream, start, end);
 }
 #endif
 
@@ -562,7 +394,7 @@ int append(backup_fd src, backup_fd stream, uint64_t start, uint64_t end)
    @return error code (non-positive)
    @retval 0   on success
 */
-int backup_stream_zeropad(backup_fd stream, size_t written) noexcept
+int backup_stream_zeropad(my_native_file stream, size_t written) noexcept
 {
   static constexpr const char zerobuf[511]{'\0'};
   written&= 511;
@@ -1529,7 +1361,7 @@ static void ustar_block_checksum(char *buf) noexcept
    @return error code (non-positive)
    @retval 0 on success
 */
-int backup_stream_write(backup_fd stream, const void *buf, size_t size)
+int backup_stream_write(my_native_file stream, const void *buf, size_t size)
   noexcept
 {
 #ifdef _WIN32
@@ -1595,7 +1427,7 @@ static inline char *ustar_zeropad(char *b, const char *s, size_t size) noexcept
 @param n_chunks number of chunks; 0 unless sparse file
 @return error code (non-positive)
 @retval 0   on success */
-int backup_stream_start(backup_fd stream,
+int backup_stream_start(my_native_file stream,
                         const char *name, mode_t mode, uint64_t size,
                         const backup_chunk *chunks, size_t n_chunks) noexcept
 {
@@ -1658,7 +1490,7 @@ int backup_stream_start(backup_fd stream,
 @param size     length of the snippet
 @return error code (non-positive)
 @retval 0   on success */
-int backup_stream_config(backup_fd stream,
+int backup_stream_config(my_native_file stream,
                          const char *config, size_t size) noexcept
 {
   /* FIXME: append to a pre-created configuration file */
@@ -1677,16 +1509,6 @@ int backup_stream_config(backup_fd stream,
 }
 
 #ifndef _WIN32
-# ifdef __linux__
-#  include <sys/sendfile.h>
-/** Copy a file to a stream or to a regular file. */
-static inline ssize_t
-send_step(int in_fd, int out_fd, size_t count, off_t *offset) noexcept
-{
-  return sendfile(out_fd, in_fd, offset, count);
-}
-# endif
-
 /**
    Zero-copy append an immutable file snippet to a stream.
 
@@ -1710,9 +1532,23 @@ int backup_stream_append_async(int src, int stream,
 {
   assert(stream != backup_sink::NO_STREAM);
 # ifdef __linux__
-  return int(stepwise<send_step,true>(src, stream, off_t(start), off_t(end)));
+  for (off_t offset{off_t(start)};;)
+  {
+    const size_t c{size_t(std::min<off_t>(end - offset, INT_MAX >> 20 << 20))};
+    ssize_t ret= sendfile(stream, src, &offset, c);
+    if (ret < 0)
+    {
+      if (errno == EAGAIN)
+        continue;
+      return int(ret);
+    }
+    if (offset == off_t(end))
+      return 0;
+    if (!ret)
+      return -1;
+  }
 # else
-  return int(pread_write<true>(src, stream, start, end));
+  return pread_write<true>(src, stream, start, end);
 # endif
 }
 #endif

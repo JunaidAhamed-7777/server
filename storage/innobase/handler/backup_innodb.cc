@@ -29,6 +29,10 @@
 #ifdef __linux__
 # include <fcntl.h>
 # include <linux/falloc.h>
+#elif defined __APPLE__
+/* We try fclonefileat(2) before backup::copy() */
+# include <sys/attr.h>
+# include <sys/clonefile.h>
 #endif
 
 #ifdef POSIX_FADV_NOREUSE
@@ -96,7 +100,8 @@ static int backup_file_create(int dirfd, const char *name) noexcept
    @return error code (non-positive)
    @retval 0  on success
 */
-static int backup_log_tail_clear(backup_fd log, uint64_t offset, uint bs_1)
+static int backup_log_tail_clear(my_native_file log, uint64_t offset,
+                                 uint bs_1)
   noexcept
 {
   ut_ad(bs_1 < log_sys.START_OFFSET);
@@ -536,11 +541,12 @@ private:
           log_sys.START_OFFSET;
         do
         {
-#ifdef clone_file_range
+#ifndef my_clone_file_range
           const uint64_t align_end{end & ~uint64_t{4095}};
           {
             const uint64_t align_begin{begin & ~uint64_t{4095}};
-            f= clone_file_range(d, s, align_begin, align_end - align_begin);
+            f= my_clone_file_range(s, d,
+                                   align_begin, align_end - align_begin);
             switch (f) {
             case 0:
               begin= align_end;
@@ -552,7 +558,7 @@ private:
             }
           }
 #endif
-          f= backup::copy(s, d, begin, end);
+          f= my_copy_file_range(s, d, begin, end);
         }
         while (false);
         if (!f && hl == first_lsn)
@@ -668,7 +674,7 @@ public:
     ut_ad(start_end >= start);
     ut_ad(start >= log_sys.get_first_lsn());
 
-    backup_fd log_dst{OS_FILE_CLOSED};
+    os_file_t log_dst{OS_FILE_CLOSED};
     tracked_log *tracked{nullptr};
 
     if (!sink.id)
@@ -1036,10 +1042,8 @@ public:
       {
         ut_ad(!(uint(begin) & bs_1));
         ut_ad(!(uint(end) & bs_1));
-#ifdef clone_file_range
-        if (1 == (err= clone_file_range(ctx.log_dst, tracked.file,
-                                        begin, end - begin)))
-#endif
+        if (1 == (err= my_clone_file_range(tracked.file, ctx.log_dst,
+                                           begin, end - begin)))
           err= backup::copy(tracked.file, ctx.log_dst, begin, end);
       }
       ut_ad(err <= 0);
@@ -1824,7 +1828,7 @@ private:
      @return error code
      @retval 0 on success
   */
-  static int extend(backup_fd f, uint64_t min_size) noexcept
+  static int extend(my_native_file f, uint64_t min_size) noexcept
   {
 #ifdef _WIN32
     LARGE_INTEGER li;
@@ -1842,7 +1846,7 @@ private:
      @return error code
      @retval 0 on success
   */
-  static int extend_log(backup_fd f, uint64_t end) noexcept
+  static int extend_log(my_native_file f, uint64_t end) noexcept
   {
     return extend(f, std::max<uint64_t>(log_sys.FILE_SIZE_MIN,
                                         (end + 4095) & ~4095ULL));
@@ -1873,9 +1877,9 @@ private:
     queue.clear();
   }
 
-#ifdef clone_file_range
+#ifndef my_clone_file_range
   /**
-     Try clone_file_range() to back up a persistent InnoDB data file.
+     Try my_clone_file_range() to back up a persistent InnoDB data file.
      @param dst          target file handle
      @param node         InnoDB data file
      @param start        the page number at the start of the file
@@ -1918,7 +1922,8 @@ private:
      @return error code (non-positive)
      @retval 0 on success
   */
-  static int stream(backup_fd stream, fil_node_t *node, const char *name,
+  static int stream(my_native_file stream, fil_node_t *node,
+                    const char *name,
                     uint32_t start, uint32_t limit) noexcept;
 
 private:
@@ -1940,7 +1945,7 @@ private:
   @param c     offset of the FILE_CHECKPOINT mini-transaction after the header
   @return error code
   @retval 0 on success */
-  static int write_checkpoint(backup_fd dst, uint64_t c) noexcept
+  static int write_checkpoint(my_native_file dst, uint64_t c) noexcept
   {
     uint64_t buf[8]{};
     write_checkpoint_buf(buf, c + log_sys.START_OFFSET);
@@ -2242,7 +2247,7 @@ public:
       chunk->offset= uint64_t(lseek(src, 0, SEEK_END));
       if (dst != sink.stream)
       {
-        err= copy_entire_file(src, dst);
+        err= my_copy_file_range(src, dst, 0, chunk->offset);
         goto close_dst;
       }
 #endif
@@ -2342,7 +2347,7 @@ buf_page_t **InnoDB_backup::backup_batch_start(buf_page_t **end,
                                   innodb_backup.ctx.BACKUP_BATCH_SIZE);
 }
 
-#ifdef clone_file_range
+#ifndef my_clone_file_range
 int InnoDB_backup::clone_file_try(int dst, fil_node_t *node,
                                   uint32_t start, uint32_t limit,
                                   uint32_t page_size, uint32_t final_limit,
@@ -2360,9 +2365,9 @@ int InnoDB_backup::clone_file_try(int dst, fil_node_t *node,
       buf_page_t **end= backup_batch_start(blocks, node->space, end_page);
       if (end)
       {
-        err= clone_file_range(dst, node->handle,
-                              uint64_t{page} * page_size,
-                              uint64_t{pages} * page_size);
+        err= my_clone_file_range(node->handle, dst,
+                                 uint64_t{page} * page_size,
+                                 uint64_t{pages} * page_size);
         page+= pages;
       }
       else
@@ -2523,7 +2528,7 @@ int InnoDB_backup::backup(IF_WIN(const char *,int) target, fil_node_t *node,
       limit= buf_dblwr.begin();
 
     buf_page_t *blocks[context::BACKUP_BATCH_SIZE_MAX];
-#ifdef clone_file_range
+#ifndef my_clone_file_range
     err= clone_file_try(f, node, start, limit, page_size, final_limit, blocks);
     if (err == 1)
 #endif
@@ -2587,7 +2592,8 @@ catch (std::bad_alloc&)
   return -1;
 }
 
-int InnoDB_backup::stream(backup_fd stream, fil_node_t *node, const char *name,
+int InnoDB_backup::stream(my_native_file stream, fil_node_t *node,
+                          const char *name,
                           uint32_t start, uint32_t limit) noexcept
 {
   const uint32_t page_size{node->space->physical_size()},

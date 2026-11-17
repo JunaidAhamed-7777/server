@@ -3869,7 +3869,8 @@ static bool maria_backup_collect(const backup_target &target,
    @return whether the operation failed; an error will have been reported
 */
 static bool maria_backup_create_file(const backup_target &target,
-                                     const char *name, backup_fd *dst) noexcept
+                                     const char *name, my_native_file *dst)
+  noexcept
 {
 #ifdef _WIN32
   char path[FN_REFLEN];
@@ -3880,7 +3881,8 @@ static bool maria_backup_create_file(const backup_target &target,
     return false;
   my_osmaperr(GetLastError());
 #else
-  *dst= openat(target.fd, name, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0666);
+  *dst= openat(target.fd, name, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC,
+               0666);
   if (*dst >= 0)
     return false;
 #endif
@@ -3902,7 +3904,7 @@ static bool maria_backup_create_file(const backup_target &target,
 */
 static int maria_backup_create(const backup_target &target,
                                const backup_sink &sink, const char *name,
-                               my_off_t size, backup_fd *dst) noexcept
+                               my_off_t size, my_native_file *dst) noexcept
 {
   *dst= sink.stream;
   if (*dst != backup_sink::NO_STREAM)
@@ -3956,7 +3958,7 @@ static bool maria_backup_copy(const backup_target &target,
   /* A page can be in the middle of being appended; skip it. */
   if (online)
     size-= size % block_size;
-  backup_fd dst;
+  my_native_file dst;
   int err= maria_backup_create(target, sink, name, size, &dst);
   if (err > 0)
     return true;
@@ -4125,7 +4127,7 @@ static bool maria_backup_log_tail(const backup_target &target,
     }
   }
   int err;
-  backup_fd dst{sink.stream};
+  my_native_file dst{sink.stream};
   const auto src= IF_WIN(my_get_osfhandle(s), s);
   const my_off_t clone_size{end_offset & ~my_off_t{TRANSLOG_PAGE_SIZE - 1}};
 
@@ -4139,10 +4141,8 @@ static bool maria_backup_log_tail(const backup_target &target,
   {
     if (maria_backup_create_file(target, name, &dst))
       goto fail;
-#ifdef clone_file_range
-    if (1 == (err= clone_file_range(dst, src, 0, clone_size)))
-#endif
-      err= backup::copy(src, dst, 0, clone_size);
+    if (1 == (err= my_clone_file_range(src, dst, 0, clone_size)))
+      err= my_copy_file_range(src, dst, 0, clone_size);
     if (!err)
     {
 #ifdef _WIN32
@@ -4207,7 +4207,7 @@ static bool maria_backup_control_file(const backup_target &target,
     my_error(err, MYF(0), name, my_errno);
     return true;
   }
-  backup_fd dst;
+  my_native_file dst;
   err= maria_backup_create(target, sink, name, size, &dst);
   if (err > 0)
     return true;
