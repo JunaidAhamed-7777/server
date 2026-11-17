@@ -113,7 +113,7 @@ int backup_target::mkdir(const char *name) const noexcept
 */
 my_native_file backup_target::create_file(const char *name) const noexcept
 {
-  std::string path{path};
+  std::string path{name};
   path.push_back('/');
   path.append(name);
   HANDLE dst= CreateFile(path.c_str(), GENERIC_WRITE, 0, my_win_file_secattr(),
@@ -121,7 +121,7 @@ my_native_file backup_target::create_file(const char *name) const noexcept
   if (dst == INVALID_HANDLE_VALUE)
   {
     my_osmaperr(GetLastError());
-    my_error(ER_CANT_CREATE_FILE, MYF(0), name, errno);
+    my_error(ER_CANT_CREATE_FILE, MYF(0), path.c_str(), errno);
   }
   return dst;
 }
