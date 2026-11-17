@@ -20,9 +20,6 @@
 #include <my_dir.h>
 #include <m_string.h>
 #include "tap.h"
-#ifdef _WIN32
-# include <dirent.h> /* rmdir() */
-#endif
 
 /* Size of the file that the tests copy */
 #define TEST_FILE_SIZE (3*1024*1024 + 4711)
