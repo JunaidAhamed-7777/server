@@ -30,6 +30,51 @@ struct backup_target
   int fd;
   bool operator==(const backup_target &o) const { return fd == o.fd; }
 #endif
+
+  /**
+     Create a subdirectory in the target directory if it does not exist.
+     @param name    subdirectory name
+     @return error code (also errno will be set)
+     @retval 0 on success (errno might not be touched)
+  */
+  int mkdir(const char *name) const noexcept;
+
+  /**
+     Create a file in the target directory.
+     @param name   file name
+     @param direct whether to bypass the file system cache
+     @return file handle
+     @retval backup_sink::NO_STREAM in case of an error
+  */
+  my_native_file create_file(const char *name, bool direct= false)
+    const noexcept;
+
+  /**
+     Set the file position on a native file handle.
+
+     @param fd      file handle from create_file()
+     @param offset  seek offset
+     @return whether the operation failed
+  */
+  static bool seek(my_native_file fd, my_off_t offset) noexcept;
+
+  /**
+     Close a file handle.
+     @param fd  file handle from create_file()
+     @return error code
+     @retval 0 on success
+  */
+  static int close(my_native_file fd) noexcept
+  { return IF_WIN(!CloseHandle(fd), ::close(fd)); }
+
+  /**
+     Append to the configuration file.
+     @param target   backup target directory
+     @param config   the configuration file snippet to append
+     @param size     length of the snippet
+     @return error code (non-positive)
+     @retval 0   on success */
+  int config_append(const char *config, size_t size) const noexcept;
 };
 
 /** BACKUP SERVER worker specific context */
@@ -124,15 +169,6 @@ int append(native_file_handle src, my_native_file stream,
            uint64_t start, uint64_t end) noexcept;
 #endif
 }
-
-/** Append to the configuration file.
-@param target   backup target directory
-@param config   the configuration file snippet to append
-@param size     length of the snippet
-@return error code (non-positive)
-@retval 0   on success */
-int backup_config_append(IF_WIN(const char*, int) target,
-                         const char *config, size_t size) noexcept;
 
 /** Append to the configuration file.
 @param target   backup stream

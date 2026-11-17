@@ -70,12 +70,130 @@ bool Sql_cmd_backup::execute(THD *thd)
 #ifdef _WIN32
 using tpool::pread;
 using tpool::pwrite;
+
+/**
+   Create a subdirectory unless we are streaming or it pre-exists.
+   @param name      base name of subdirectory to create
+   @return error code (also errno will be set)
+   @retval 0 on success (errno might not be touched)
+*/
+int backup_target::mkdir(const char *name) const noexcept
+{
+  if (!path)
+    return 0;
+  int ret= snprintf(NULL, 0, "%s/%s", path, name) + 1;
+  char *path= static_cast<char*>(malloc(ret));
+  if (!path)
+  {
+    my_error(ER_TOO_LONG_IDENT, MYF(0), name);
+    return 1;
+  }
+  snprintf(path, ret, "%s/%s", this->path, name);
+  if (CreateDirectory(path, NULL))
+    ret= 0;
+  else
+  {
+    const DWORD err= GetLastError();
+    ret= err != ERROR_ALREADY_EXISTS;
+    if (ret)
+    {
+      my_osmaperr(err);
+      my_error(ER_CANT_CREATE_FILE, MYF(0), path, errno);
+    }
+  }
+  free(path);
+  return ret;
+}
+
+/**
+   Create a file in the target directory.
+   @param name   file name
+   @param direct whether to bypass the file system cache
+   @return file handle
+   @retval backup_sink::NO_STREAM in case of an error
+*/
+my_native_file backup_target::create_file(const char *name, bool direct)
+  const noexcept
+{
+  std::string path{path};
+  path.push_back('/');
+  path.append(name);
+  HANDLE dst= CreateFile(path.c_str(), GENERIC_WRITE, 0, my_win_file_secattr(),
+                         CREATE_NEW, direct
+                         ? FILE_ATTRIBUTE_NORMAL
+                         : FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING,
+                         nullptr);
+  if (dst == INVALID_HANDLE_VALUE)
+  {
+    my_osmaperr(GetLastError());
+    my_error(ER_CANT_CREATE_FILE, MYF(0), name, errno);
+  }
+  return dst;
+}
+
+bool backup_target::seek(my_native_file fd, my_off_t offset) noexcept
+{
+  LARGE_INTEGER pos;
+  pos.QuadPart= offset;
+  if (SetFilePointerEx(fd, pos, nullptr, FILE_BEGIN))
+    return false;
+  my_osmaperr(GetLastError());
+  return true;
+}
 #else
 # include <sys/types.h>
 # include <dirent.h>
 # ifdef __linux__
 #  include <sys/sendfile.h>
 # endif
+
+/**
+   Create a subdirectory unless we are streaming or it pre-exists.
+   @param name      base name of subdirectory to create
+   @return error code (also errno will be set)
+   @retval 0 on success (errno might not be touched)
+*/
+int backup_target::mkdir(const char *name) const noexcept
+{
+  if (fd == -1 || likely(!mkdirat(fd, name, 0777)) || errno == EEXIST)
+    return 0;
+  my_error(ER_CANT_CREATE_FILE, MYF(0), name, errno);
+  return 1;
+}
+
+/**
+   Create a file in the target directory.
+   @param name   file name
+   @param direct whether to bypass the file system cache
+   @return file handle
+   @retval backup_sink::NO_STREAM in case of an error
+*/
+my_native_file backup_target::create_file(const char *name, bool direct)
+  const noexcept
+{
+  constexpr int flags{O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC};
+  constexpr int mode= 0666;
+  int dst=
+    openat(fd, name,
+#ifdef O_DIRECT
+           (direct * O_DIRECT) |
+#endif
+           flags, mode);
+  if (dst >= 0)
+    return dst;
+# ifdef O_DIRECT
+  if (direct)
+    dst= openat(fd, name, flags, mode);
+# endif
+  if (dst < 0)
+    my_error(ER_CANT_CREATE_FILE, MYF(0), name, errno);
+  return dst;
+}
+
+bool backup_target::seek(my_native_file fd, my_off_t offset) noexcept
+{
+  return offset != my_off_t(lseek(fd, offset, SEEK_SET));
+}
 #endif
 
 /**
@@ -178,51 +296,6 @@ int copy(native_file_handle in_fd,
 {
   return pread_write<false>(in_fd, out_fd, o, end);
 }
-#else
-/**
-   Copy or stream a file.
-   @param target     BACKUP SERVER target (possibly, a directory)
-   @param sink       per-thread context (possibly, a stream to write to)
-   @param src        source file descriptor from open(), to be closed here
-   @param path       file name
-   @return error code (also errno will be set)
-   @retval 0 on success
-*/
-int copy_or_stream(const backup_target &target, const backup_sink &sink,
-                   int src, const char *path) noexcept
-{
-  int ret= -1, dst= sink.stream;
-  if (src < 0)
-  {
-    my_error(ER_CANT_OPEN_FILE, MYF(0), path, errno);
-    return ret;
-  }
-  if (dst < 0)
-  {
-    dst= openat(target.fd, path, O_CREAT | O_EXCL | O_WRONLY, 0666);
-    if (dst < 0)
-      my_error(ER_CANT_CREATE_FILE, MYF(0), path, errno);
-    else
-    {
-      ret= my_copy_file(src, dst) || close(dst);
-      if (ret)
-      write_error:
-        my_error(ER_ERROR_ON_WRITE, MYF(0), path, errno);
-    }
-  }
-  else
-  {
-    uint64_t end= (uint64_t) lseek(src, 0, SEEK_END);
-    ret= backup_stream_start(dst, path, 0644, end, NULL, 0) ||
-      backup::append(src, dst, 0, end) ||
-      backup_stream_zeropad(dst, (size_t) end);
-    if (ret)
-      goto write_error;
-  }
-  close(src);
-  return ret;
-}
-#endif
 
 /**
    Copy or stream a file.
@@ -236,10 +309,6 @@ int copy_or_stream(const backup_target &target, const backup_sink &sink,
 int copy_or_stream(const backup_target &target, const backup_sink &sink,
                    const char *path, size_t dir_prefix) noexcept
 {
-#ifndef _WIN32
-  return copy_or_stream(target, sink,
-                        open(path, O_RDONLY), path + dir_prefix);
-#else
   int ret= -1;
   if (sink.stream == INVALID_HANDLE_VALUE)
   {
@@ -304,13 +373,10 @@ int copy_or_stream(const backup_target &target, const backup_sink &sink,
     }
   }
   return ret;
-#endif
 }
 
-#ifdef _WIN32
 int append(my_native_file src, my_native_file stream,
-           uint64_t start, uint64_t end)
-  noexcept
+           uint64_t start, uint64_t end) noexcept
 {
   return append(native_file_handle{src}, stream, start, end);
 }
@@ -321,6 +387,57 @@ int append(native_file_handle src, my_native_file stream,
   return pread_write<true>(src, stream, start, end);
 }
 #else
+/**
+   Copy or stream a file.
+   @param target     BACKUP SERVER target (possibly, a directory)
+   @param sink       per-thread context (possibly, a stream to write to)
+   @param src        source file descriptor from open(), to be closed here
+   @param path       file name
+   @return error code (also errno will be set)
+   @retval 0 on success
+*/
+int copy_or_stream(const backup_target &target, const backup_sink &sink,
+                   int src, const char *path) noexcept
+{
+  int ret= -1, dst= sink.stream;
+  if (src < 0)
+  {
+    my_error(ER_CANT_OPEN_FILE, MYF(0), path, errno);
+    return ret;
+  }
+  if (dst < 0)
+  {
+    dst= openat(target.fd, path, O_CREAT | O_EXCL | O_WRONLY, 0666);
+    if (dst < 0)
+      my_error(ER_CANT_CREATE_FILE, MYF(0), path, errno);
+    else
+    {
+      ret= my_copy_file(src, dst) || close(dst);
+      if (ret)
+      write_error:
+        my_error(ER_ERROR_ON_WRITE, MYF(0), path, errno);
+    }
+  }
+  else
+  {
+    uint64_t end= (uint64_t) lseek(src, 0, SEEK_END);
+    ret= backup_stream_start(dst, path, 0644, end, NULL, 0) ||
+      backup::append(src, dst, 0, end) ||
+      backup_stream_zeropad(dst, (size_t) end);
+    if (ret)
+      goto write_error;
+  }
+  close(src);
+  return ret;
+}
+
+int copy_or_stream(const backup_target &target, const backup_sink &sink,
+                   const char *path, size_t dir_prefix) noexcept
+{
+  return copy_or_stream(target, sink,
+                        open(path, O_RDONLY), path + dir_prefix);
+}
+
 /**
    Append a file snippet to stream,
    after a corresponding call to backup_stream_start().
@@ -407,38 +524,30 @@ int backup_stream_zeropad(my_native_file stream, size_t written) noexcept
 @param size     length of the snippet
 @return error code (non-positive)
 @retval 0   on success */
-int backup_config_append(IF_WIN(const char*, int) target,
-                         const char *config, size_t size) noexcept
+int backup_target::config_append(const char *config, size_t size)
+  const noexcept
 {
   /* FIXME: append to a pre-created configuration file */
+  auto dst= create_file("backup.cnf");
+
 #ifdef _WIN32
-  HANDLE dst;
+  if (dst != INVALID_HANDLE_VALUE)
   {
-    std::string path{target};
-    path.append("/backup.cnf");
-    dst= CreateFile(path.c_str(), GENERIC_WRITE, 0,
-                    my_win_file_secattr(), CREATE_NEW,
-                    FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (dst != INVALID_HANDLE_VALUE)
+    BOOL ok;
+    for (;;)
     {
-      BOOL ok;
-      for (;;)
-      {
-        DWORD written;
-        ok= WriteFile(dst, config, DWORD(size), &written, nullptr);
-        if (ok || GetLastError() != ERROR_IO_PENDING)
-          break;
-        assert(written < DWORD(size));
-        config+= written;
-        size-= size_t(written);
-      }
-      if (CloseHandle(dst) & ok)
-        return 0;
+      DWORD written;
+      ok= WriteFile(dst, config, DWORD(size), &written, nullptr);
+      if (ok || GetLastError() != ERROR_IO_PENDING)
+        break;
+      assert(written < DWORD(size));
+      config+= written;
+      size-= size_t(written);
     }
+    if (CloseHandle(dst) & ok)
+      return 0;
   }
 #else
-  int dst= openat(target, "backup.cnf",
-                  O_CREAT | O_EXCL | O_TRUNC | O_WRONLY, 0666);
   if (dst >= 0)
   {
     ssize_t ret;
@@ -542,49 +651,6 @@ struct backup_context
     }
 #endif
     return false;
-  }
-
-  /**
-     Create a subdirectory unless we are streaming or it pre-exists.
-     @param target    BACKUP SERVER TO target directory
-     @param name      base name of subdirectory to create
-     @return error code (also errno will be set)
-     @retval 0 on success (errno might not be touched)
-  */
-  static int mkdir(const backup_target &target, const char *name) noexcept
-  {
-#ifdef _WIN32
-    if (!target.path)
-      return 0;
-    int ret= snprintf(NULL, 0, "%s/%s", target.path, name) + 1;
-    char *path= static_cast<char*>(malloc(ret));
-    if (!path)
-    {
-      my_error(ER_TOO_LONG_IDENT, MYF(0), name);
-      return 1;
-    }
-    snprintf(path, ret, "%s/%s", target.path, name);
-    if (CreateDirectory(path, NULL))
-      ret= 0;
-    else
-    {
-      const DWORD err= GetLastError();
-      ret= err != ERROR_ALREADY_EXISTS;
-      if (ret)
-      {
-        my_osmaperr(err);
-        my_error(ER_CANT_CREATE_FILE, MYF(0), path, errno);
-      }
-    }
-    free(path);
-    return ret;
-#else
-    if (target.fd == -1 || likely(!mkdirat(target.fd, name, 0777)) ||
-        errno == EEXIST)
-      return 0;
-    my_error(ER_CANT_CREATE_FILE, MYF(0), name, errno);
-    return 1;
-#endif
   }
 
   /**
@@ -695,7 +761,7 @@ struct backup_context
             if (is_in_ignore_db_dirs_list(de->d_name))
               continue;
           }
-          if (!mkdir(target, de->d_name))
+          if (!target.mkdir(de->d_name))
           {
             int dfd= openat(dirfd(dir), de->d_name, O_DIRECTORY);
             d= de;
@@ -768,7 +834,7 @@ struct backup_context
               snprintf(path, sizeof path, "%s/*.*", d.cFileName))
           name_too_long:
             my_error(ER_TOO_LONG_IDENT, MYF(0), path);
-          else if (mkdir(target, d.cFileName));
+          else if (target.mkdir(d.cFileName));
           else if ((subdir= FindFirstFileA(path, &sd)) !=
                    INVALID_HANDLE_VALUE)
             goto consume_subdir;
@@ -1061,7 +1127,6 @@ static bool backup_steps(THD *thd, backup_target_stage *target_stage,
     my_error(ER_UNKNOWN_ERROR, MYF(0));
   return fail;
 }
-
 
 /**
    BACKUP SERVER driver

@@ -109,13 +109,7 @@ static int backup_log_tail_clear(my_native_file log, uint64_t offset,
   const size_t o{size_t(offset) & bs_1};
   if (!o)
     return 0;
-  offset+= log_sys.START_OFFSET;
-#ifdef _WIN32
-  LARGE_INTEGER pos;
-  pos.QuadPart= offset;
-#endif
-  if (IF_WIN(!SetFilePointerEx(log, pos, nullptr, FILE_BEGIN),
-             offset != uint64_t(lseek(log, off_t(offset), SEEK_SET))))
+  if (backup_target::seek(log, offset + log_sys.START_OFFSET))
     return -1;
   return backup_stream_write(log, field_ref_zero, bs_1 + 1 - o);
 }
@@ -1949,11 +1943,7 @@ private:
   {
     uint64_t buf[8]{};
     write_checkpoint_buf(buf, c + log_sys.START_OFFSET);
-#ifdef _WIN32
-    LARGE_INTEGER pos{0};
-#endif
-    if (IF_WIN(!SetFilePointerEx(dst, pos, nullptr, FILE_BEGIN),
-               lseek(dst, 0, SEEK_SET)))
+    if (backup_target::seek(dst, 0))
       return -1;
     return backup_stream_write(dst, buf, sizeof buf);
   }
@@ -2030,7 +2020,7 @@ public:
       {write_config_buf(config, *static_cast<context*>(sink.ha_data))};
     ut_ad(size <= CONFIG_SIZE);
     return sink.stream == sink.NO_STREAM
-      ? backup_config_append(IF_WIN(target.path, target.fd), config, size)
+      ? target.config_append(config, size)
       : backup_stream_config(sink.stream, config, size);
   }
 

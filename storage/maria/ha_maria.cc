@@ -45,6 +45,7 @@ C_MODE_END
 #include "mysql/plugin.h"
 #include "mysql/service_print_check_msg.h"
 #include "debug.h"
+#include "aligned.h"
 #include <aria_backup.h>
 
 /*
@@ -3780,28 +3781,6 @@ struct maria_backup_context
 };
 
 /**
-   Create a subdirectory in the target directory if it does not exist.
-   @param target  backup target directory
-   @param name    subdirectory name
-   @return whether the operation failed
-*/
-static bool maria_backup_mkdir(const backup_target &target, const char *name)
-  noexcept
-{
-#ifdef _WIN32
-  char path[FN_REFLEN];
-  strxnmov(path, sizeof path - 1, target.path, "/", name, NullS);
-  if (!my_mkdir(path, 0777, MYF(0)) || my_errno == EEXIST)
-    return false;
-#else
-  if (!mkdirat(target.fd, name, 0777) || errno == EEXIST)
-    return false;
-#endif
-  my_error(ER_CANT_CREATE_FILE, MYF(0), name, errno);
-  return true;
-}
-
-/**
    Collect the Aria tables to copy.
    @param target  backup target
    @param sink    worker context
@@ -3836,10 +3815,9 @@ static bool maria_backup_collect(const backup_target &target,
       const char *name= subdir->dir_entry[j].name;
       const char *ext= fn_ext(name);
       /* Skip #sql files, like the scan in sql_backup.cc */
-      if (strcmp(ext, MARIA_NAME_IEXT) ||
-          is_prefix(name, tmp_file_prefix))
+      if (strcmp(ext, MARIA_NAME_IEXT) || is_prefix(name, tmp_file_prefix))
         continue;
-      if (!mkdir_done && (fail= maria_backup_mkdir(target, d.name)))
+      if (!mkdir_done && (fail= target.mkdir(d.name)))
         break;
       mkdir_done= true;
       /* "database/table" without the extension */
@@ -3862,35 +3840,6 @@ static bool maria_backup_collect(const backup_target &target,
 }
 
 /**
-   Create a file in the BACKUP SERVER TO directory.
-   @param target  backup target
-   @param name    file name in the backup
-   @param dst     the file or the stream to write to
-   @return whether the operation failed; an error will have been reported
-*/
-static bool maria_backup_create_file(const backup_target &target,
-                                     const char *name, my_native_file *dst)
-  noexcept
-{
-#ifdef _WIN32
-  char path[FN_REFLEN];
-  strxnmov(path, sizeof path - 1, target.path, "/", name, NullS);
-  *dst= CreateFile(path, GENERIC_WRITE, 0, my_win_file_secattr(),
-                   CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (*dst != INVALID_HANDLE_VALUE)
-    return false;
-  my_osmaperr(GetLastError());
-#else
-  *dst= openat(target.fd, name, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC,
-               0666);
-  if (*dst >= 0)
-    return false;
-#endif
-  my_error(ER_CANT_CREATE_FILE, MYF(0), name, errno);
-  return true;
-}
-
-/**
    Create a file in the backup.
    @param target  backup target
    @param sink    worker context
@@ -3909,7 +3858,8 @@ static int maria_backup_create(const backup_target &target,
   *dst= sink.stream;
   if (*dst != backup_sink::NO_STREAM)
     return backup_stream_start(*dst, name, 0644, size, nullptr, 0);
-  return maria_backup_create_file(target, name, dst);
+  *dst= target.create_file(name);
+  return *dst == backup_sink::NO_STREAM;
 }
 
 /**
@@ -3942,12 +3892,14 @@ static bool maria_backup_copy(const backup_target &target,
 {
   const uint block_size= context->capabilities.block_size;
   const File src= index ? context->kfile : context->dfile;
-  const bool online= context->capabilities.online_backup_safe;
 #ifndef _WIN32
-  if (!online)
+  if (!context->capabilities.online_backup_safe)
     /* backup::copy_or_stream() closes its copy of the descriptor */
     return backup::copy_or_stream(target, sink,
                                   fcntl(src, F_DUPFD_CLOEXEC, 0), name) != 0;
+  constexpr bool online{true};
+#else
+  const bool online= context->capabilities.online_backup_safe;
 #endif
   my_off_t size= my_seek(src, 0, MY_SEEK_END, MYF(0));
   if (size == MY_FILEPOS_ERROR)
@@ -4110,17 +4062,25 @@ static bool maria_backup_log_tail(const backup_target &target,
   const File s{my_open(path, O_RDONLY | O_BINARY, MYF(MY_WME))};
   if (s < 0)
     return true;
-  uchar buf[TRANSLOG_PAGE_SIZE];
+  uchar *buf= nullptr;
   if (size_t(end_offset) & (TRANSLOG_PAGE_SIZE - 1))
   {
-    if (my_pread(s, buf, TRANSLOG_PAGE_SIZE, size - TRANSLOG_PAGE_SIZE,
-                 MYF(MY_WME | MY_NABP)))
+    buf= static_cast<uchar*>(aligned_malloc(TRANSLOG_PAGE_SIZE, 4096));
+    if (unlikely(!buf))
+    {
+      my_error(ER_OUT_OF_RESOURCES, MYF(ME_BELL+ME_ERROR_LOG+ME_FATAL));
+      goto fail;
+    }
+    if (unlikely(my_pread(s, buf,
+                          TRANSLOG_PAGE_SIZE, size - TRANSLOG_PAGE_SIZE,
+                          MYF(MY_WME | MY_NABP))))
     {
     fail:
       my_close(s, MYF(0));
+      aligned_free(buf);
       return true;
     }
-    if (translog_cut_page(buf, end))
+    if (unlikely(translog_cut_page(buf, end)))
     {
       my_error(ER_ERROR_ON_READ, MYF(0), name, HA_ERR_CRASHED);
       goto fail;
@@ -4139,30 +4099,22 @@ static bool maria_backup_log_tail(const backup_target &target,
   }
   else
   {
-    if (maria_backup_create_file(target, name, &dst))
+    dst= target.create_file(name, true);
+    if (dst == sink.NO_STREAM)
       goto fail;
     if (1 == (err= my_clone_file_range(src, dst, 0, clone_size)))
       err= my_copy_file_range(src, dst, 0, clone_size);
     if (!err)
-    {
-#ifdef _WIN32
-      LARGE_INTEGER pos;
-      pos.QuadPart= clone_size;
-      if (!SetFilePointerEx(dst, pos, nullptr, FILE_BEGIN))
-      {
-        my_osmaperr(GetLastError());
-        err= -1;
-      }
-#else
-      err= clone_size != my_off_t(lseek(dst, clone_size, SEEK_SET));
-#endif
-    }
+      err= target.seek(dst, clone_size);
   }
   my_close(s, MYF(0));
-  if (!err && size_t(end_offset) & (TRANSLOG_PAGE_SIZE - 1))
-    err= backup_stream_write(dst, buf, TRANSLOG_PAGE_SIZE);
-  if (sink.stream == backup_sink::NO_STREAM &&
-      IF_WIN(!CloseHandle(dst), close(dst)))
+  if (buf)
+  {
+    if (!err)
+      err= backup_stream_write(dst, buf, TRANSLOG_PAGE_SIZE);
+    aligned_free(buf);
+  }
+  if (sink.stream == backup_sink::NO_STREAM && target.close(dst))
   {
     IF_WIN(my_osmaperr(GetLastError()),);
     err= -1;
