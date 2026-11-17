@@ -42,12 +42,10 @@ struct backup_target
   /**
      Create a file in the target directory.
      @param name   file name
-     @param direct whether to bypass the file system cache
      @return file handle
      @retval backup_sink::NO_STREAM in case of an error
   */
-  my_native_file create_file(const char *name, bool direct= false)
-    const noexcept;
+  my_native_file create_file(const char *name) const noexcept;
 
   /**
      Set the file position on a native file handle.

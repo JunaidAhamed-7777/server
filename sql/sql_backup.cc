@@ -108,21 +108,16 @@ int backup_target::mkdir(const char *name) const noexcept
 /**
    Create a file in the target directory.
    @param name   file name
-   @param direct whether to bypass the file system cache
    @return file handle
    @retval backup_sink::NO_STREAM in case of an error
 */
-my_native_file backup_target::create_file(const char *name, bool direct)
-  const noexcept
+my_native_file backup_target::create_file(const char *name) const noexcept
 {
   std::string path{path};
   path.push_back('/');
   path.append(name);
   HANDLE dst= CreateFile(path.c_str(), GENERIC_WRITE, 0, my_win_file_secattr(),
-                         CREATE_NEW, direct
-                         ? FILE_ATTRIBUTE_NORMAL
-                         : FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING,
-                         nullptr);
+                         CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (dst == INVALID_HANDLE_VALUE)
   {
     my_osmaperr(GetLastError());
@@ -164,27 +159,13 @@ int backup_target::mkdir(const char *name) const noexcept
 /**
    Create a file in the target directory.
    @param name   file name
-   @param direct whether to bypass the file system cache
    @return file handle
    @retval backup_sink::NO_STREAM in case of an error
 */
-my_native_file backup_target::create_file(const char *name, bool direct)
-  const noexcept
+my_native_file backup_target::create_file(const char *name) const noexcept
 {
   constexpr int flags{O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC};
-  constexpr int mode= 0666;
-  int dst=
-    openat(fd, name,
-#ifdef O_DIRECT
-           (direct * O_DIRECT) |
-#endif
-           flags, mode);
-  if (dst >= 0)
-    return dst;
-# ifdef O_DIRECT
-  if (direct)
-    dst= openat(fd, name, flags, mode);
-# endif
+  int dst{openat(fd, name, flags, 0666)};
   if (dst < 0)
     my_error(ER_CANT_CREATE_FILE, MYF(0), name, errno);
   return dst;

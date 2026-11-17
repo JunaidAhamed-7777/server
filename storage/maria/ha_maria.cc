@@ -4099,7 +4099,7 @@ static bool maria_backup_log_tail(const backup_target &target,
   }
   else
   {
-    dst= target.create_file(name, true);
+    dst= target.create_file(name);
     if (dst == sink.NO_STREAM)
       goto fail;
     if (1 == (err= my_clone_file_range(src, dst, 0, clone_size)))
